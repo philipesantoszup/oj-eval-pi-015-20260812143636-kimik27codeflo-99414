@@ -1,5 +1,9 @@
 #include <bits/stdc++.h>
 #include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <chrono>
+#include <random>
 using namespace std;
 
 #pragma pack(push, 1)
@@ -16,12 +20,16 @@ struct Entry {
 static_assert(sizeof(Entry) == 80, "Entry size must be 80");
 
 constexpr int B = 65537;
+constexpr int64_t BUCKETS_HEADER_SIZE = 8; // seed
+constexpr int64_t BUCKETS_DATA_SIZE = B * 8LL;
+constexpr int64_t BUCKETS_FILE_SIZE = BUCKETS_HEADER_SIZE + BUCKETS_DATA_SIZE;
 const char* BUCKETS_FILE = "buckets.dat";
 const char* ENTRIES_FILE = "entries.dat";
 
+int fd_buckets = -1;
+int fd_entries = -1;
 vector<int64_t> buckets;
-FILE* f_buckets = nullptr;
-FILE* f_entries = nullptr;
+uint64_t hash_seed = 0;
 int64_t next_free_offset = 0;
 
 static inline uint64_t splitmix64(uint64_t x) {
@@ -32,7 +40,7 @@ static inline uint64_t splitmix64(uint64_t x) {
 }
 
 static inline int hash_key(const char* key, int len) {
-    uint64_t h = 1469598103934665603ULL;
+    uint64_t h = hash_seed;
     for (int i = 0; i < len; i++) {
         h ^= static_cast<uint8_t>(key[i]);
         h *= 1099511628211ULL;
@@ -44,63 +52,92 @@ static inline bool key_equals(const Entry& e, const char* key, int len) {
     return e.key_len == static_cast<uint8_t>(len) && memcmp(e.key, key, len) == 0;
 }
 
+static inline void full_pread(int fd, void* buf, size_t count, off_t offset) {
+    char* p = static_cast<char*>(buf);
+    size_t done = 0;
+    while (done < count) {
+        ssize_t r = pread(fd, p + done, count - done, offset + static_cast<off_t>(done));
+        if (r <= 0) break;
+        done += r;
+    }
+}
+
+static inline void full_pwrite(int fd, const void* buf, size_t count, off_t offset) {
+    const char* p = static_cast<const char*>(buf);
+    size_t done = 0;
+    while (done < count) {
+        ssize_t r = pwrite(fd, p + done, count - done, offset + static_cast<off_t>(done));
+        if (r < 0) break;
+        done += r;
+    }
+}
+
+static uint64_t generate_seed() {
+    std::random_device rd;
+    if (rd.entropy() > 0) {
+        uint64_t a = rd();
+        uint64_t b = rd();
+        return (a << 32) ^ b;
+    }
+    return static_cast<uint64_t>(chrono::steady_clock::now().time_since_epoch().count());
+}
+
 void init_files() {
     struct stat st;
-    bool buckets_ok = (stat(BUCKETS_FILE, &st) == 0 && st.st_size == static_cast<off_t>(B * 8LL));
+    bool buckets_ok = (stat(BUCKETS_FILE, &st) == 0 && st.st_size == static_cast<off_t>(BUCKETS_FILE_SIZE));
     bool entries_ok = (stat(ENTRIES_FILE, &st) == 0);
 
     if (!buckets_ok) {
-        f_buckets = fopen(BUCKETS_FILE, "wb");
+        fd_buckets = open(BUCKETS_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        hash_seed = generate_seed();
+        full_pwrite(fd_buckets, &hash_seed, sizeof(hash_seed), 0);
         static int64_t zeros[4096];
         memset(zeros, 0, sizeof(zeros));
-        int remaining = B;
+        int64_t remaining = BUCKETS_DATA_SIZE;
+        int64_t off = BUCKETS_HEADER_SIZE;
         while (remaining > 0) {
-            int batch = min(remaining, static_cast<int>(sizeof(zeros) / 8));
-            fwrite(zeros, 8, batch, f_buckets);
+            size_t batch = min(remaining, static_cast<int64_t>(sizeof(zeros)));
+            full_pwrite(fd_buckets, zeros, batch, off);
+            off += batch;
             remaining -= batch;
         }
-        fclose(f_buckets);
+        close(fd_buckets);
     }
 
-    f_buckets = fopen(BUCKETS_FILE, "r+b");
+    fd_buckets = open(BUCKETS_FILE, O_RDWR, 0666);
+    full_pread(fd_buckets, &hash_seed, sizeof(hash_seed), 0);
     buckets.resize(B);
-    rewind(f_buckets);
-    fread(buckets.data(), 8, B, f_buckets);
+    full_pread(fd_buckets, buckets.data(), BUCKETS_DATA_SIZE, BUCKETS_HEADER_SIZE);
 
     if (!entries_ok) {
-        f_entries = fopen(ENTRIES_FILE, "w+b");
+        fd_entries = open(ENTRIES_FILE, O_RDWR | O_CREAT | O_TRUNC, 0666);
     } else {
-        f_entries = fopen(ENTRIES_FILE, "r+b");
+        fd_entries = open(ENTRIES_FILE, O_RDWR, 0666);
     }
-    fseek(f_entries, 0, SEEK_END);
-    next_free_offset = ftell(f_entries);
+    next_free_offset = lseek(fd_entries, 0, SEEK_END);
     if (next_free_offset == 0) {
-        // Reserve offset 0 as null sentinel; first real entry starts at sizeof(Entry).
         next_free_offset = sizeof(Entry);
     }
 }
 
-static inline void write_bucket(int idx) {
-    fseek(f_buckets, idx * 8LL, SEEK_SET);
-    fwrite(&buckets[idx], 8, 1, f_buckets);
+static inline void sync_buckets() {
+    full_pwrite(fd_buckets, &hash_seed, sizeof(hash_seed), 0);
+    full_pwrite(fd_buckets, buckets.data(), BUCKETS_DATA_SIZE, BUCKETS_HEADER_SIZE);
 }
 
 static inline int64_t append_entry(const Entry& e) {
     int64_t off = next_free_offset;
-    fseek(f_entries, off, SEEK_SET);
-    fwrite(&e, sizeof(Entry), 1, f_entries);
+    full_pwrite(fd_entries, &e, sizeof(Entry), off);
     next_free_offset += sizeof(Entry);
     return off;
 }
 
 static inline void read_entry(int64_t off, Entry& e) {
-    fseek(f_entries, off, SEEK_SET);
-    fread(&e, sizeof(Entry), 1, f_entries);
+    full_pread(fd_entries, &e, sizeof(Entry), off);
 }
 
 static inline void write_entry(int64_t off, const Entry& e) {
-    fseek(f_entries, off, SEEK_SET);
-    fwrite(&e, sizeof(Entry), 1, f_entries);
+    full_pwrite(fd_entries, &e, sizeof(Entry), off);
 }
 
 void do_insert(const char* key, int len, int value) {
@@ -121,7 +158,6 @@ void do_insert(const char* key, int len, int value) {
     e.padding[0] = e.padding[1] = 0;
     off = append_entry(e);
     buckets[h] = off;
-    write_bucket(h);
 }
 
 void do_delete(const char* key, int len, int value) {
@@ -131,10 +167,9 @@ void do_delete(const char* key, int len, int value) {
     Entry e;
     while (off != 0) {
         read_entry(off, e);
-        if (!e.deleted && key_equals(e, key, len) && e.value == value) {
+        if (key_equals(e, key, len) && e.value == value) {
             if (prev == -1) {
                 buckets[h] = e.next;
-                write_bucket(h);
             } else {
                 Entry prev_e;
                 read_entry(prev, prev_e);
@@ -156,7 +191,7 @@ void do_find(const char* key, int len) {
     values.clear();
     while (off != 0) {
         read_entry(off, e);
-        if (!e.deleted && key_equals(e, key, len)) {
+        if (key_equals(e, key, len)) {
             values.push_back(e.value);
         }
         off = e.next;
@@ -196,7 +231,8 @@ int main() {
         }
     }
 
-    if (f_buckets) fclose(f_buckets);
-    if (f_entries) fclose(f_entries);
+    sync_buckets();
+    if (fd_buckets >= 0) close(fd_buckets);
+    if (fd_entries >= 0) close(fd_entries);
     return 0;
 }
